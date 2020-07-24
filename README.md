@@ -1,122 +1,32 @@
-# VGEOIP
 
-This service is based on the original [Apilayer's Freegeoip project](https://github.com/apilayer/freegeoip), with a little modifications.
 
-## VGEOIP
 
-VGEOIP service primary function is to do geolocation based on IP. It could help detect the city, the country, and so on and so forth.
 
-## Technical overview
 
-There are 3 separate, inter-related parts of VGEOIP:
 
-- `apiserver` package (located at `freegreoip/apiserver`)
-- `main` package (located at `freegeoip/cmd/freegeoip`)
-- `freegeoip` package (located at the root folder)
-
-The `main` package is the point of entry. This is definitely the package that gets compiled. This package however, is just a _gate_ into `apiserver`, so the actual workload is basically not in the `main` package but in `apiserver.Run()`.
-
-Things that `apiserver` package does:
-
-| Description | File |
-|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
-| - Read configuration from env. var.<br/>- Setup the configuration object.<br/>- Some of interesting envvar:newrelic config, where to log, DB update interval | config.go |
-| - Record database events to prometheus.<br/>- Record country code of the clients to prometheus - Record IP versions counter to prometheus.<br/>- Record the number of active client per protocol to prometheus | metrics.go |
-| - Essentially running the server (using TLS/not) | main.go |
-| - Return data in CSV/JSON/XML format upon request.<br/>- Perform IP lookup.<br/>- Downloading the lookup database.<br/>- Performing rate limiting (if configured). | api.go |
-
-The core component of the `apiserver` package is the `NewConfig` and `NewHandler` functions that both create a `Config` and `apiHandler` struct respectively. `apiHandler` is a struct that consist the following structure:
-
-```go
-type apiHandler struct {
-  db    *freegeoip.DB
-  conf  *Config
-  cors  *cors.Cors
-  nrapp newrelic.Application
-}
+# start geoip server
+```
+cd cmd/freegeoip/
+go build
+export KEY=<Your Maxmind License Key>
+PORT=8090
+./freegeoip -http :$PORT -use-x-forwarded-for -public ./public -quota-backend map -quota-max 0
+curl http://localhost:$PORT/json/8.8.8.8
 ```
 
-However, `NewHandler` does not just create `apiHandler` struct, it actually also create the multiplexer from which all requests come in contact with. So, every single web request is handled by this multiplexer.
 
-However, before it can serve any request, `NewHandler` turns out will also attempt to download a database using the `openDB` function of the same package (`apiserver`).  When the system unable to setup the handler (for a host of reasons, one of which being unable to download the database), the system will fatally exit.
-
-`openDB` basically will download a databse if it doesn't have a copy yet in the local filesystem. And, if we have the license and user ID, it will setup a special configuration that will help us later on to download the paid version of the database.
-
-`openDB` eventually is calling `OpenURL` function of the `freegeoip` package (only associated with `db.go`). This package contains routines that help with:
-
-- Downloading the database
-- Opening the database, and setting up the reader/data-access object
-- Watching the file when it's created/modified and notify it through appropriate channel back up
-- Automatically update the database upon a due time/`backoff` period (default: 1 day)
-- Performing `Lookup` of an IP
-
-Once `OpenURL` is called, an `autoUpdate` function will kick in automatically in the background using a goroutine (similar to a Ruby's thread but lightweight). It will check if a newer database exist by checking the `X-Database-MD5` and the file's size.
-
-As we might already guess, there are two kinds of database: the paid version and the free version. If we run the service without the paid license, it will never send a request to download the paid version of the database.
-
-## Deployment: Fargate
-
-In the AWS world, there are many kind of deployment services that one can use to deploy app into it:
-
-- [EC2](https://aws.amazon.com/ec2/): the bare metal
-- [AWS Elastic Beanstalk](https://aws.amazon.com/elasticbeanstalk/): easy to use code deployment service somewhat trying to replicate Heroku, with 'but'
-- [EKS Elastic Container Service for Kubernetes](https://aws.amazon.com/eks/): Kube-style container-orchestrated deployment. Pretty expensive.
-- [ECS Elastic Container Service](https://aws.amazon.com/ecs/): AWS own's answer of container-orchestrated deployment. Not expensive.
-- [Fargate](https://aws.amazon.com/fargate/): Disregarding the concept of region and zone, this container-based deployment only ask us about what kind of CPU and Memory do we want, and deploy it to either ECS or EKS-manner (EKS not yet supported as of August 2018). Far so easy to deploy at.
-
-Here is the step by step of deployment to AWS Fargate:
-
-- Install Python
-- Install awscli
-
+# build linux binary
 ```
-$ pip install awscli
+GOARCH=amd64 GOOS=linux CGO_ENABLED=0 go build -ldflags '-w -s' -o freegeoip-linux
 ```
 
-- [Configure awscli](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html): require ACCESS KEY ID of your user account for it to be usable.
-- Login to ECR:
 
 ```
-$ $(aws ecr get-login --no-include-email --region ap-northeast-1)
+## for original
+export INITIAL_DATABASE_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=nZnOPrucKQ3t1chO"
+./freegeoip -http :8090 -use-x-forwarded-for -public ./public -quota-backend map -quota-max 0
 ```
 
-- Obtain the Maxmind license key by signing up with a free account: https://www.maxmind.com/en/geolite2/signup
-
-- Build the docker image:
-Replace `LICENSE_KEY` with the license key you have from your Maxmind account
-
-```
-$ docker build . -t vgeoip:latest --build-arg INITIAL_DATABASE_URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=LICENSE_KEY"
-```
-
-To see list of available images:
-
-```
-$ docker images
-```
-
-- Construct the docker registry address for AWS:
-
-  - [Find out your account ID](https://console.aws.amazon.com/billing/home?#/account) eg: 607558961840
-  - [Determine the region ID](https://docs.aws.amazon.com/general/latest/gr/rande.html), eg: ap-northeast-1 for Tokyo
-
-  Your constructed registry address: 607558961840.dkr.ecr. ap-northeast-1.amazonaws.com
-  
-- Tag the image with ECR repository tag:
-
-```
-$ docker tag vgeoip:latest 607558961840.dkr.ecr.ap-northeast-1.amazonaws.com/vgeoip:latest
-```
-
-- Push the tagged image to ECR
-
-  - Ensure the repository (eg: `vgeoip`) is already [created beforehand](https://us-west-2.console.aws.amazon.com/ecs/home?region=us-west-2#/repositories). Click create repository on that page if haven't. Ensure Repository URI matches your ID and your region properly.
-  - Push:
-
-  ```
-  $ docker push 607558961840.dkr.ecr.ap-northeast-1.amazonaws.com/vgeoip:latest
-  ```
-
-## Deployment: Heroku
-Add ENV `INITIAL_DATABASE_URL` with "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz&license_key=LICENSE_KEY"
-where LICENSE_KEY is the Maxmind license key after signing up a free account: https://www.maxmind.com/en/geolite2/signup
+# merge & customization  
+2020-01-09 - https://github.com/voyagin/freegeoip  
+2018-07-02 - https://github.com/apilayer/freegeoip
